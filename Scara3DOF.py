@@ -15,7 +15,6 @@ from collections import deque
 
 # ==========================================
 # 1. System Configuration & Parameters
-# Reference: README Section 2 & 4
 # ==========================================
 
 PLC_IP = '192.168.1.250'
@@ -28,7 +27,6 @@ COMMAND_DEBOUNCE_MS = 100
 L1, L2, L3, L4 = 0.13, 0.115, 0.13, 0.014
 
 # Workspace Limits (Calculated from Horizontal Links L2 & L3)
-# Reference: README Section 3.5 Workspace Analysis
 R_MIN = abs(L2 - L3)  # |115 - 130| = 15mm
 R_MAX = L2 + L3       # 115 + 130 = 245mm
 
@@ -38,12 +36,11 @@ Q_LIMITS = {
     'z':  (-0.08, 0.0)  # -80mm to 0mm
 }
 
-Z_HOME = L1 + L4  # Visual height at Z=0
+Z_HOME = L1 + L4
 Z_BOTTOM = Z_HOME + Q_LIMITS['z'][0]
 
 # ==========================================
 # 2. Robot Model (Modified DH)
-# Reference: README Section 3.1 & Appendix A
 # ==========================================
 robot = rtb.DHRobot([
     # Joint 1: Base Rotation
@@ -72,54 +69,67 @@ ik_queue = queue.Queue(maxsize=1)
 ik_result_queue = queue.Queue(maxsize=1)
 
 # ==========================================
-# 3. Helper Functions
-# Reference: README Section 7.2 & Appendix
+# 3. Helper Functions (Fixed Calculations)
 # ==========================================
 
 def angle_to_pulses(angle_rad):
-    """Reference: README Section 7.2 Step 1"""
-    STEPS_PER_REV = 400
-    GEAR_RATIO = 3.75
-    
-    # Convert to degrees for calculation as per README formula
+    """
+    Mapping angle directly to PLC Register range (0-3000)
+    90 degrees = 3000 pulses
+    """
     angle_deg = np.degrees(angle_rad)
-    # Formula: (angle_deg / 360) * STEPS * RATIO
-    total_pulses = (angle_deg / 360.0) * STEPS_PER_REV * GEAR_RATIO
     
-    pulse_count = int(abs(total_pulses))
-    # Direction: 0=CW (Positive?), 1=CCW (Negative) - Adjusted based on README logic
-    direction_flag = 1 if total_pulses < 0 else 0
+    # Logic: (Current Angle / Max Angle 90.0) * Max Pulse 3000
+    # This ensures full utilization of the 0-3000 range
+    total_pulses = (abs(angle_deg) / 90.0) * 3000.0
+    
+    pulse_count = int(total_pulses)
+    
+    # Cap at 3000 to prevent overflow
+    if pulse_count > 3000:
+        pulse_count = 3000
+        
+    # Direction Flag: 1 if negative, 0 if positive
+    direction_flag = 1 if angle_deg < 0 else 0
     
     return pulse_count, direction_flag
 
 def z_to_pulses(z_mm):
-    """Reference: README Section 7.2 Step 2"""
-    # z_mm input is expected to be relative (0 to -80)
-    Z_MIN = -80
-    Z_MAX = 0
-    Z_PULSE_MAX = 32000
+    """
+    Mapping Z position to PLC Register range
+    0 to -80mm maps to 0-32000 pulses
+    """
+    # z_mm is typically 0 to -80
+    Z_RANGE = 80.0
+    PULSE_MAX = 32000.0
     
-    # Clamp input
-    z_mm = max(Z_MIN, min(Z_MAX, z_mm))
+    val = abs(z_mm)
+    if val > Z_RANGE:
+        val = Z_RANGE
+        
+    normalized = val / Z_RANGE
+    pulses = int(normalized * PULSE_MAX)
     
-    # Normalized 0.0 to 1.0 based on displacement
-    normalized = abs(z_mm) / abs(Z_MIN)
-    pulses = int(normalized * Z_PULSE_MAX)
-    
-    # Direction 1 if going down (negative)
+    # Direction: 1 for down (negative Z), 0 for up
     direction_flag = 1 if z_mm < 0 else 0
     
     return pulses, direction_flag
 
 def is_in_workspace(x, y, z_rel):
-    """Reference: README Section 3.5"""
+    """
+    Strict check if point is within annular workspace and Z limits
+    """
     r = np.sqrt(x**2 + y**2)
-    # Check annular workspace
-    if not (R_MIN <= r <= R_MAX):
+    
+    # Check Radius (Annular ring)
+    # Using small epsilon tolerance (0.001) for float comparison
+    if not (R_MIN - 0.001 <= r <= R_MAX + 0.001):
         return False
-    # Check Z limits
-    if not (Q_LIMITS['z'][0] <= z_rel <= Q_LIMITS['z'][1]):
+        
+    # Check Z
+    if not (Q_LIMITS['z'][0] - 0.001 <= z_rel <= Q_LIMITS['z'][1] + 0.001):
         return False
+        
     return True
 
 # ==========================================
@@ -127,31 +137,28 @@ def is_in_workspace(x, y, z_rel):
 # ==========================================
 
 def ik_worker():
-    """Reference: README Section 7.1 Step 3"""
     while current_state['running']:
         try:
             if not ik_queue.empty():
                 target_pos = ik_queue.get()
                 x, y, z_abs = target_pos
-                z_rel = z_abs - Z_HOME # Convert absolute GUI Z to relative Robot Z
+                z_rel = z_abs - Z_HOME 
                 
-                # Pre-check workspace before IK (Optimization)
+                # Check workspace before solving IK to save CPU
                 if not is_in_workspace(x, y, z_rel):
-                    # Skip calculation if out of bounds
                     continue
 
                 T = SE3(x, y, z_rel)
                 
-                # IK using Levenberg-Marquardt
+                # Solve IK
                 sol = robot.ikine_LM(
                     T, 
                     q0=current_state['q_target'], 
-                    mask=[1, 1, 1, 0, 0, 0] # x, y, z only
+                    mask=[1, 1, 1, 0, 0, 0]
                 )
                 
                 if sol.success:
                     q_new = sol.q.copy()
-                    # Apply Joint Limits
                     q_new[0] = np.clip(q_new[0], *Q_LIMITS['j1'])
                     q_new[1] = np.clip(q_new[1], *Q_LIMITS['j2'])
                     q_new[2] = np.clip(z_rel, *Q_LIMITS['z'])
@@ -168,12 +175,12 @@ def ik_worker():
             time.sleep(0.05)
 
 def command_scheduler():
-    """Reference: README Section 7.3 Debouncing"""
     while current_state['running']:
         try:
             current_time = time.time()
             with current_state['command_lock']:
                 if current_state['pending_command'] is not None:
+                    # Debounce check
                     time_since_last = (current_time - current_state['last_command_time']) * 1000
                     
                     if time_since_last >= COMMAND_DEBOUNCE_MS:
@@ -195,10 +202,11 @@ def command_scheduler():
             time.sleep(0.05)
 
 def plc_worker():
-    """Reference: README Section 7.2 Communication"""
     client = None
     reconnect_delay = 2.0
     last_sent_q = None
+    
+    print("🔌 Starting PLC Worker...")
     
     while current_state['running']:
         if client is None or not client.connected:
@@ -206,14 +214,14 @@ def plc_worker():
                 client = ModbusTcpClient(PLC_IP, port=PLC_PORT, timeout=1.0)
                 if client.connect():
                     current_state['plc_connected'] = True
-                    print(f"✓ Connected to PLC at {PLC_IP}")
+                    print(f"✅ Connected to PLC at {PLC_IP}")
                 else:
                     current_state['plc_connected'] = False
                     time.sleep(reconnect_delay)
                     continue
             except Exception as e:
                 current_state['plc_connected'] = False
-                print(f"✗ PLC Connection Error: {e}")
+                print(f"❌ PLC Connection Error: {e}")
                 time.sleep(reconnect_delay)
                 continue
 
@@ -221,34 +229,37 @@ def plc_worker():
             if not plc_command_queue.empty():
                 q_to_send = plc_command_queue.get()
                 
-                # Check delta to avoid sending duplicate positions
-                if last_sent_q is None or np.linalg.norm(q_to_send - last_sent_q) > 0.0005:
+                # Check if position changed significantly enough to send
+                # Reduced threshold to make it more sensitive
+                if last_sent_q is None or np.linalg.norm(q_to_send - last_sent_q) > 0.0001:
                     
-                    # Calculate Pulses using README logic
+                    # Convert to pulses
                     val_j1, flag_j1 = angle_to_pulses(q_to_send[0])
                     val_j2, flag_j2 = angle_to_pulses(q_to_send[1])
-                    val_z, flag_z   = z_to_pulses(q_to_send[2] * 1000) # Convert m to mm
+                    val_z, flag_z   = z_to_pulses(q_to_send[2] * 1000)
                     
-                    # Register Mapping (README Section 6.2)
                     registers = [
-                        val_j1, flag_j1,  # Reg 0-1: J1
-                        val_j2, flag_j2,  # Reg 2-3: J2
-                        val_z,  flag_z    # Reg 4-5: Z
+                        val_j1, flag_j1,
+                        val_j2, flag_j2,
+                        val_z,  flag_z
                     ]
 
-                    client.write_registers(0, registers)
-                    last_sent_q = q_to_send.copy()
-                    current_state['q_actual'] = q_to_send.copy()
-                    print(f"→ Sent: J1={np.rad2deg(q_to_send[0]):.1f} J2={np.rad2deg(q_to_send[1]):.1f} Z={q_to_send[2]*1000:.1f}")
+                    # Write to PLC
+                    res = client.write_registers(0, registers)
+                    
+                    if not res.isError():
+                        last_sent_q = q_to_send.copy()
+                        current_state['q_actual'] = q_to_send.copy()
+                        # Debug Print: Shows Pulse Values
+                        print(f"📤 Sent: J1[{val_j1},{flag_j1}] J2[{val_j2},{flag_j2}] Z[{val_z}]")
+                    else:
+                        print("⚠ PLC Write Error")
                 
-            time.sleep(0.02)
+            time.sleep(0.01)
         except Exception as e:
-            print(f"PLC Send Error: {e}")
+            print(f"PLC Send Logic Error: {e}")
             if client:
-                try:
-                    client.close()
-                except:
-                    pass
+                client.close()
             client = None
             current_state['plc_connected'] = False
             time.sleep(0.1)
@@ -426,7 +437,6 @@ class RobotGUI:
         self.ax.set_title("Top View - XY Plane", fontsize=11, pad=15, 
                          fontweight='600', color='#1a1a1a')
         
-        # Plot limit includes full reach
         r_view = R_MAX + 0.1
         self.ax.set_xlim(-r_view, r_view)
         self.ax.set_ylim(-r_view, r_view)
@@ -435,7 +445,7 @@ class RobotGUI:
         self.ax.set_xlabel('X (m)', fontsize=9, color='#616161')
         self.ax.set_ylabel('Y (m)', fontsize=9, color='#616161')
         
-        # Draw Workspace (Corrected to L2 & L3 based on README)
+        # Workspace Drawing
         workspace_inner = Circle((0, 0), R_MIN, color='#ffebee', 
                                 fill=True, alpha=0.3, zorder=0)
         workspace_outer = Circle((0, 0), R_MAX, color='#e3f2fd', 
@@ -443,7 +453,6 @@ class RobotGUI:
         self.ax.add_patch(workspace_inner)
         self.ax.add_patch(workspace_outer)
         
-        # Outer boundary line
         self.ax.add_patch(Circle((0, 0), R_MAX, color='#1976d2', 
                                 fill=False, ls='--', lw=2, alpha=0.4))
         
@@ -475,7 +484,7 @@ class RobotGUI:
         self.ax_z = self.fig_z.add_subplot(111, facecolor='#fafafa')
         self.ax_z.set_title("Z-Axis", fontsize=10, pad=10, 
                            fontweight='600', color='#1a1a1a')
-        # Display Z from Bottom (-80) to Top (0, shown as offset height)
+        
         self.ax_z.set_ylim((Z_BOTTOM - 0.01)*1000, (Z_HOME + 0.01)*1000)
         self.ax_z.set_xlim(0, 1)
         self.ax_z.set_xticks([])
@@ -534,7 +543,6 @@ class RobotGUI:
         if x is None or y is None:
             return
         
-        # Use queue for non-blocking IK request
         try:
             ik_queue.get_nowait()
         except:
@@ -558,7 +566,6 @@ class RobotGUI:
             new_z = max(Z_BOTTOM, min(Z_HOME, new_z))
             current_state['target_z'] = new_z
             
-            # For Z movement, we update target immediately if X,Y is valid
             q = current_state['q_target'].copy()
             q[2] = np.clip(new_z - Z_HOME, *Q_LIMITS['z'])
             current_state['q_target'] = q
@@ -583,7 +590,7 @@ class RobotGUI:
             z_abs = float(self.entry_z.get()) / 1000.0
             z_rel = z_abs - Z_HOME
             
-            # Strict Workspace Check (As per README)
+            # Workspace Check
             if not is_in_workspace(x, y, z_rel):
                 dist = np.sqrt(x**2 + y**2)
                 if z_rel < Q_LIMITS['z'][0] or z_rel > Q_LIMITS['z'][1]:
@@ -632,9 +639,8 @@ class RobotGUI:
             )
     
     def on_home(self):
-        # Home position: L1+L2 (Max reach) in X, 0 in Y, Z_HOME
         self.entry_x.delete(0, tk.END)
-        self.entry_x.insert(0, f"{(L2+L3)*1000:.1f}") # Extended arm
+        self.entry_x.insert(0, f"{(L2+L3)*1000:.1f}")
         self.entry_y.delete(0, tk.END)
         self.entry_y.insert(0, "0.0")
         self.entry_z.delete(0, tk.END)
@@ -644,8 +650,7 @@ class RobotGUI:
     def on_get_current(self):
         q = current_state['q_display']
         
-        # Forward Kinematics for display
-        # Note: L2 is Link 1 (Horiz), L3 is Link 2 (Horiz)
+        # FK Calculation for manual inputs
         x = (L2 * np.cos(q[0]) + L3 * np.cos(q[0] + q[1])) * 1000
         y = (L2 * np.sin(q[0]) + L3 * np.sin(q[0] + q[1])) * 1000
         z = (Z_HOME + q[2]) * 1000
@@ -668,8 +673,6 @@ class RobotGUI:
                 q_new = ik_result_queue.get()
                 current_state['q_target'] = q_new
                 
-                # Only update command if not dragging (to avoid flood) 
-                # OR update if it's the final position
                 with current_state['command_lock']:
                     current_state['pending_command'] = q_new
                         
@@ -701,8 +704,8 @@ class RobotGUI:
 
             q = current_state['q_display']
             
-            # Forward Kinematics Visualization
-            # L2 = Arm 1, L3 = Arm 2
+            # Forward Kinematics for Plot
+            # L2 = Link 1, L3 = Link 2
             x1 = L2 * np.cos(q[0])
             y1 = L2 * np.sin(q[0])
             x2 = x1 + L3 * np.cos(q[0] + q[1])
@@ -724,13 +727,12 @@ class RobotGUI:
             self.bar_z[0].set_height(z_display)
             self.target_z_line.set_ydata([z_display, z_display])
             
-            # Color coding for Z
             if z_display < 20:
-                self.bar_z[0].set_color('#e53935') # Low
+                self.bar_z[0].set_color('#e53935')
             elif z_display > (Z_HOME*1000 - 20):
-                self.bar_z[0].set_color('#43a047') # High
+                self.bar_z[0].set_color('#43a047')
             else:
-                self.bar_z[0].set_color('#fb8c00') # Mid
+                self.bar_z[0].set_color('#fb8c00')
             
             self.canvas.draw_idle()
             self.canvas_z.draw_idle()
@@ -754,7 +756,6 @@ class RobotGUI:
             )
             
             mx, my = self.mouse_xy
-            # Calculate robot frame Z for checking
             current_z_rel = current_state['target_z'] - Z_HOME
             in_workspace = is_in_workspace(mx, my, current_z_rel)
             
